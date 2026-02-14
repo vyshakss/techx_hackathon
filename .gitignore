@@ -1,0 +1,12 @@
+# Ignore the virtual environment (huge folders)
+tf_env/
+venv/
+.env
+
+# Ignore Python junk
+__pycache__/
+*.pyc
+
+# Ignore IDE settings
+.vscode/
+.idea/
