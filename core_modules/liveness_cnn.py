@@ -1,89 +1,101 @@
 import os
+import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from tensorflow.keras.applications import Xception
+from tensorflow.keras.applications.xception import preprocess_input
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.optimizers import Adam
+from sklearn.utils import class_weight
 
-def build_deepfake_detector():
-    """
-    Builds a CNN architecture for binary classification (Real vs Fake).
-    """
-    model = Sequential([
-        # 1. Feature Extraction (Looking for pixel artifacts, blur, and unnatural edges)
-        Conv2D(32, (3, 3), activation='relu', input_shape=(224, 224, 3)),
-        MaxPooling2D(pool_size=(2, 2)),
-        
-        Conv2D(64, (3, 3), activation='relu'),
-        MaxPooling2D(pool_size=(2, 2)),
-        
-        Conv2D(128, (3, 3), activation='relu'),
-        MaxPooling2D(pool_size=(2, 2)),
-        
-        # 2. Flattening the 2D matrices into a 1D array for the Dense layers
-        Flatten(),
-        
-        # 3. Fully Connected Layers (Making the actual decision)
-        Dense(512, activation='relu'),
-        Dropout(0.5), # Drops 50% of neurons randomly to prevent overfitting
-        
-        # 4. Output Layer (Binary Classification: 0 for Real, 1 for Fake)
-        Dense(1, activation='sigmoid') 
-    ])
+# --- CONFIGURATION ---
+# Enabling XLA compiler can provide a small speed boost on some CPUs
+tf.config.optimizer.set_jit(True)
+
+# 224x224 is faster for a hackathon demo than the standard 299x299
+IMG_SIZE = (224, 224) 
+MODEL_PATH = 'core_modules/xception_deepfake.h5'
+BATCH_SIZE = 32 # Higher batch size is generally faster on modern CPUs
+
+def build_xception_model():
+    """Initializes Xception with a custom classification head."""
+    # Load base model with pre-trained ImageNet weights
+    base_model = Xception(weights='imagenet', include_top=False, input_shape=(*IMG_SIZE, 3))
     
-    # Compile the model with Adam optimizer and binary crossentropy loss
-    model.compile(optimizer='adam',
-                  loss='binary_crossentropy',
+    # Freeze the base model to preserve features
+    base_model.trainable = False
+    
+    # Custom classification head
+    x = GlobalAveragePooling2D()(base_model.output)
+    x = Dense(256, activation='relu')(x)
+    x = Dropout(0.5)(x) # Dropout helps prevent overfitting on small data
+    predictions = Dense(1, activation='sigmoid')(x)
+    
+    model = Model(inputs=base_model.input, outputs=predictions)
+    
+    # Adam optimizer with a stable learning rate
+    model.compile(optimizer=Adam(learning_rate=0.001), 
+                  loss='binary_crossentropy', 
                   metrics=['accuracy'])
-    
     return model
 
-def train_and_save_model():
-    """
-    Simulates training the model on the Celeb-DF dataset and saves it as an .h5 file.
-    """
-    print("Building CNN Architecture...")
-    model = build_deepfake_detector()
-    model.summary()
-    
-    # --- NOTE FOR THE HACKATHON ---
-    # To actually train this, you need to download the Celeb-DF dataset, 
-    # put the real faces in a 'data/real' folder, and fake faces in a 'data/fake' folder.
-    # Below is the logic you will use once you download those images.
-    
-    print("\nPreparing ImageDataGenerators...")
-    # This automatically loads images from your folders and scales the pixel values
-    datagen = ImageDataGenerator(rescale=1./255, validation_split=0.2)
-    
-    # In a real run, you would uncomment these to load the actual dataset:
-    '''
-    train_generator = datagen.flow_from_directory(
-        'data/',
-        target_size=(224, 224),
-        batch_size=32,
+def train_model():
+    """Trains the model for 3 epochs with Turbo Mode settings."""
+    if not os.path.exists('dataset'):
+        print("[ERROR] 'dataset' folder not found. Run extraction script first.")
+        return
+
+    # Data Generators
+    datagen = ImageDataGenerator(
+        preprocessing_function=preprocess_input, # Required for Xception
+        horizontal_flip=True,
+        validation_split=0.2
+    )
+
+    train_gen = datagen.flow_from_directory(
+        'dataset',
+        target_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
         class_mode='binary',
         subset='training'
     )
-    
-    validation_generator = datagen.flow_from_directory(
-        'data/',
-        target_size=(224, 224),
-        batch_size=32,
+
+    val_gen = datagen.flow_from_directory(
+        'dataset',
+        target_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
         class_mode='binary',
         subset='validation'
     )
-    
-    print("\nTraining the model (this will take time)...")
-    model.fit(train_generator, epochs=10, validation_data=validation_generator)
-    '''
-    
-    # 5. Save the trained weights to the .h5 file
-    os.makedirs('models', exist_ok=True)
-    save_path = 'models/deepfake_model.h5'
-    
-    # For now, we are saving the "untrained" initialized model just so you have the file structure
-    model.save(save_path)
-    print(f"\nSuccess! Model architecture saved to {save_path}")
 
-# Run the script to generate the .h5 file
+    # Calculate Class Weights to handle your 2.5:1 imbalance
+    cw = class_weight.compute_class_weight(
+        'balanced', 
+        classes=np.unique(train_gen.classes), 
+        y=train_gen.classes
+    )
+    cw_dict = dict(enumerate(cw))
+    print(f"[INFO] Applied Class Weights: {cw_dict}")
+
+    model = build_xception_model()
+
+    # --- THE 3-EPOCH TURBO FIT ---
+    # We use steps_per_epoch to look at a representative sample each pass
+    print("🚀 Starting 3-Epoch Training Session...")
+    model.fit(
+        train_gen,
+        steps_per_epoch=100, 
+        validation_data=val_gen,
+        validation_steps=20,
+        epochs=3, # <--- Set to 3 as requested
+        class_weight=cw_dict,
+        verbose=1
+    )
+
+    # Save the resulting model
+    model.save(MODEL_PATH)
+    print(f"✅ SUCCESS: Model saved to {MODEL_PATH}")
+
 if __name__ == "__main__":
-    train_and_save_model()
+    train_model()
